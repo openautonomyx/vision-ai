@@ -1,0 +1,28 @@
+services:
+  vision:
+    build: .
+    container_name: vision-ai
+    restart: unless-stopped
+    ports:
+      - "8120:8000"
+    environment:
+      - YOLO_MODEL=yolo26n.pt
+      - WHISPER_MODEL=base
+    volumes:
+      - vision_data:/app/data
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    networks:
+      - platform_frontend
+      - platform_internal
+
+volumes:
+  vision_data:
+
+networks:
+  platform_frontend:
+    external: true
+  platform_internal:
+    external: true
