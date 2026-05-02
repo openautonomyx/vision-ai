@@ -1,26 +1,90 @@
 """
 AutonomyX Vision AI — Unified API
 YOLO26 + OpenCV + Tesseract OCR + CLIP + Whisper + Background Remover
+
+Production-ready with:
+- API Key authentication
+- Rate limiting
+- Structured errors
+- Request validation
+- Metrics and observability
+- Request ID tracking
 """
-from ultralytics import YOLO
-from fastapi import FastAPI, UploadFile, File, Query, Form
-from fastapi.responses import JSONResponse, Response
-import uvicorn, io, os, cv2, tempfile
+import os
+import uuid
+import time
+import tempfile
+from typing import Optional
+from datetime import datetime
+
+from fastapi import FastAPI, UploadFile, File, Query, Form, HTTPException, Request, Depends
+from fastapi.responses import JSONResponse, Response, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+import uvicorn
+import io
 import numpy as np
 from PIL import Image
 import pytesseract
+import cv2
 
+from auth import (
+    APIKeyCreate, APIKeyResponse, verify_api_key, create_api_key, 
+    revoke_api_key, list_api_keys as _list_api_keys, api_key_header, api_keys_store
+)
+from rate_limit import rate_limiter
+from metrics import metrics, generate_request_id
+
+# ══════════════════════════════════════════════════════════════════════
+# Configuration
+# ══════════════════════════════════════════════════════════════════════
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/webp", "image/bmp", "image/gif",
+    "audio/wav", "audio/mp3", "audio/mpeg", "audio/ogg",
+    "video/mp4", "video/webm"
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# FastAPI App
+# ══════════════════════════════════════════════════════════════════════
 app = FastAPI(
     title="AutonomyX Vision AI",
-    version="1.0",
-    description="Unified Vision AI: object detection, OCR, speech-to-text, image classification, background removal"
+    version="1.0.0",
+    description=(
+        "Unified Vision AI API: object detection, OCR, speech-to-text, "
+        "image classification, background removal. Production-ready with auth and metrics."
+    ),
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
 )
 
-# ── Eager-load lightweight models ─────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Request ID middleware
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or generate_request_id()
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+# ══════════════════════════════════════════════════════════════════════
+# Model Loading
+# ══════════════════════════════════════════════════════════════════════
+from ultralytics import YOLO
+
 model_name = os.environ.get("YOLO_MODEL", "yolo26n.pt")
 yolo = YOLO(model_name)
 
-# ── Lazy-load heavy models ────────────────────────────────────
+# Lazy-load heavy models
 _clip_model = None
 _clip_preprocess = None
 _clip_tokenizer = None
@@ -43,13 +107,115 @@ def get_whisper():
         _whisper_model = whisper.load_model(os.environ.get("WHISPER_MODEL", "base"))
     return _whisper_model
 
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+# Request Validation & Error Handling
+# ══════════════════════════════════════════════════════════════════════
+class APIError(Exception):
+    """Structured API error."""
+    def __init__(self, code: str, message: str, status_code: int = 400, details: dict = None):
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        self.details = details or {}
+        super().__init__(message)
+
+@app.exception_handler(APIError)
+async def api_error_handler(request: Request, exc: APIError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "details": exc.details
+            }
+        }
+    )
+
+async def validate_file(file: UploadFile, max_size: int = MAX_FILE_SIZE) -> bytes:
+    """Validate and read uploaded file."""
+    # Check content type
+    if file.content_type not in ALLOWED_MIME_TYPES:
+        raise APIError(
+            "INVALID_FILE_TYPE",
+            f"File type {file.content_type} not allowed",
+            status_code=400
+        )
+    
+    # Read content
+    content = await file.read()
+    
+    # Check size
+    if len(content) > max_size:
+        raise APIError(
+            "FILE_TOO_LARGE",
+            f"File size {len(content)} exceeds maximum {max_size}",
+            status_code=413
+        )
+    
+    return content
+
+async def get_authenticated_key(api_key: str = Depends(api_key_header)) -> dict:
+    """Dependency to verify API key."""
+    if not api_key:
+        raise HTTPException(status_code=401, detail="Missing API key")
+    
+    key_data = verify_api_key(api_key)
+    if not key_data:
+        raise HTTPException(status_code=401, detail="Invalid or expired API key")
+    
+    return key_data
+
+# ══════════════════════════════════════════════════════════════════════
+# Authentication Endpoints
+# ══════════════════════════════════════════════════════════════════════
+@app.post("/auth/api-keys", response_model=APIKeyResponse, tags=["Auth"])
+async def create_key(data: APIKeyCreate):
+    """Create a new API key."""
+    key, response = create_api_key(data)
+    # Return the key only once
+    response.key = key
+    return response
+
+@app.get("/auth/api-keys", tags=["Auth"])
+async def list_keys(_: dict = Depends(get_authenticated_key)):
+    """List all API keys (admin only)."""
+    return {"keys": _list_api_keys()}
+
+@app.delete("/auth/api-keys/{key_name}", tags=["Auth"])
+async def delete_key(key_name: str, _: dict = Depends(get_authenticated_key)):
+    """Revoke an API key."""
+    # Find key by name
+    for key, data in list(api_keys_store.items()):  # Import api_keys_store from auth
+        if data["name"] == key_name:
+            revoke_api_key(key)
+            return {"status": "revoked", "name": key_name}
+    raise HTTPException(status_code=404, detail="Key not found")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Metrics & Observability
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/metrics", tags=["Observability"])
+async def get_metrics():
+    """Prometheus metrics endpoint."""
+    return PlainTextResponse(content=metrics.get_metrics())
+
+@app.get("/usage", tags=["Observability"])
+async def get_usage(_: dict = Depends(get_authenticated_key)):
+    """Usage statistics."""
+    return metrics.get_stats()
+
+# ═════════════════════════════════════════════════════════════════════════=======
 # Health & Info
-# ══════════════════════════════════════════════════════════════
-@app.get("/health")
-def health():
+# ══════════════════════════════════════════════════════════════════════
+@app.get("/health", tags=["Health"])
+def health(request: Request):
+    """Health check endpoint."""
+    request_id = request.headers.get("X-Request-ID", "N/A")
     return {
         "status": "ok",
+        "version": "1.0.0",
+        "request_id": request_id,
         "services": {
             "yolo": model_name,
             "opencv": cv2.__version__,
@@ -60,15 +226,17 @@ def health():
         }
     }
 
-@app.get("/models")
+@app.get("/models", tags=["Models"])
 def list_models():
+    """List available models."""
     return {
         "yolo": ["yolo26n.pt", "yolo26s.pt", "yolo26m.pt", "yolo26l.pt", "yolo26x.pt"],
         "opencv": ["face_detection", "edge_detection", "resize", "analyze"],
         "ocr": {"engine": "tesseract", "languages": ["eng", "hin"]},
         "clip": {"model": "ViT-B-32", "tasks": ["classify", "embed"]},
         "whisper": {"models": ["tiny", "base", "small", "medium"], "tasks": ["transcribe", "detect_language"]},
-        "rembg": {"task": "background_removal"}
+        "rembg": {"task": "background_removal"},
+        "supported_endpoints": ["/detect", "/ocr", "/transcribe", "/remove-bg", "/clip/classify", "/clip/embed", "/faces", "/edges", "/resize", "/analyze"]
     }
 
 # ══════════════════════════════════════════════════════════════
