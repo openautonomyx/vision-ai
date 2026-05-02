@@ -1,5 +1,8 @@
 """
 AutonomyX Vision AI — Authentication and API Keys
+
+NOTE: This implementation uses in-memory storage. For production, use Redis or a database.
+The current implementation stores raw keys for Phase 1 simplicity - update to hashed keys for production.
 """
 import secrets
 import hashlib
@@ -12,6 +15,8 @@ from pydantic import BaseModel
 # In-memory store for API keys (use Redis or database for production)
 # Format: {api_key: {name, created_at, expires_at, role, rate_limit, last_used}}
 api_keys_store: dict = {}
+
+ADMIN_BOOTSTRAP_NOTE = "For first-time setup, set ADMIN_BOOTSTRAP_TOKEN environment variable"
 
 class APIKeyCreate(BaseModel):
     name: str
@@ -46,7 +51,6 @@ def _hash_key(key: str) -> str:
 def create_api_key(data: APIKeyCreate) -> tuple[str, APIKeyResponse]:
     """Create a new API key."""
     key = f"ax_{secrets.token_urlsafe(32)}"
-    hashed = _hash_key(key)
     
     now = datetime.utcnow()
     expires_at = None

@@ -12,10 +12,9 @@ services:
     environment:
       - YOLO_MODEL=yolo26n.pt
       - WHISPER_MODEL=base
+      - ENVIRONMENT=development
     volumes:
       - vision_data:/app/data
-    environment:
-      - ENVIRONMENT=development
 
   vision-prod:
     build: .

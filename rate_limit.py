@@ -11,7 +11,7 @@ class RateLimiter:
     
     def __init__(self):
         self._buckets: dict[str, dict] = defaultdict(lambda: {
-            "tokens": 0,
+            "tokens": 100,  # Initialize with full tokens
             "last_refill": datetime.utcnow()
         })
         self._lock = threading.Lock()
@@ -20,6 +20,12 @@ class RateLimiter:
         """Refill tokens based on time elapsed."""
         now = datetime.utcnow()
         bucket = self._buckets[key]
+        
+        # If bucket was newly created, start with full tokens
+        if bucket["tokens"] == 100:
+            bucket["last_refill"] = now
+            return
+            
         last = bucket["last_refill"]
         
         # Calculate tokens to add (1 token per second / rate_limit * 60)
@@ -32,6 +38,13 @@ class RateLimiter:
     def check(self, key: str, rate_limit: int, cost: int = 1) -> bool:
         """Check if request is allowed and consume tokens."""
         with self._lock:
+            # Initialize bucket if needed
+            if key not in self._buckets:
+                self._buckets[key] = {
+                    "tokens": rate_limit,
+                    "last_refill": datetime.utcnow()
+                }
+            
             self._refill(key, rate_limit)
             bucket = self._buckets[key]
             
@@ -43,6 +56,8 @@ class RateLimiter:
     def get_remaining(self, key: str, rate_limit: int) -> int:
         """Get remaining tokens."""
         with self._lock:
+            if key not in self._buckets:
+                return rate_limit
             self._refill(key, rate_limit)
             return self._buckets[key]["tokens"]
     

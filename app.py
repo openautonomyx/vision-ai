@@ -68,13 +68,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request ID middleware
+# Request ID and metrics middleware
 @app.middleware("http")
-async def add_request_id(request: Request, call_next):
+async def request_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or generate_request_id()
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
+    start = time.time()
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        duration = time.time() - start
+        # Record metrics
+        metrics.increment(f"vision_api_requests_total", {"endpoint": request.url.path, "status": getattr(response, 'status_code', 0)})
+        metrics.observe(f"vision_api_request_duration_seconds", duration, {"endpoint": request.url.path})
+        response.headers["X-Request-ID"] = request_id
 
 # ══════════════════════════════════════════════════════════════════════
 # Model Loading
@@ -156,7 +163,7 @@ async def validate_file(file: UploadFile, max_size: int = MAX_FILE_SIZE) -> byte
     return content
 
 async def get_authenticated_key(api_key: str = Depends(api_key_header)) -> dict:
-    """Dependency to verify API key."""
+    """Dependency to verify API key with rate limiting."""
     if not api_key:
         raise HTTPException(status_code=401, detail="Missing API key")
     
@@ -164,29 +171,77 @@ async def get_authenticated_key(api_key: str = Depends(api_key_header)) -> dict:
     if not key_data:
         raise HTTPException(status_code=401, detail="Invalid or expired API key")
     
+    # Check rate limit
+    if not rate_limiter.check(api_key, key_data["rate_limit"]):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    
     return key_data
+
+async def require_admin(key_data: dict = Depends(get_authenticated_key)) -> dict:
+    """Dependency to require admin role."""
+    if key_data.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return key_data
+
+# Bootstrap admin key (set via environment for first-time setup)
+ADMIN_BOOTSTRAP_TOKEN = os.environ.get("ADMIN_BOOTSTRAP_TOKEN", "")
+
+async def require_bootstrap_or_admin():
+    """Require bootstrap token or admin role."""
+    def _check(request: Request):
+        # Check for bootstrap token
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header == f"Bearer {ADMIN_BOOTSTRAP_TOKEN}":
+            return True
+        # Otherwise require admin
+        try:
+            key_data = verify_api_key(
+                request.headers.get("X-API-Key", "").replace("Bearer ", "")
+            )
+            if key_data and key_data.get("role") == "admin":
+                return True
+        except:
+            pass
+        raise HTTPException(status_code=403, detail="Admin or bootstrap required")
+    return _check
 
 # ══════════════════════════════════════════════════════════════════════
 # Authentication Endpoints
 # ══════════════════════════════════════════════════════════════════════
 @app.post("/auth/api-keys", response_model=APIKeyResponse, tags=["Auth"])
-async def create_key(data: APIKeyCreate):
-    """Create a new API key."""
+async def create_key(request: Request, data: APIKeyCreate):
+    """Create a new API key. Requires bootstrap token or admin role."""
+    # Check for bootstrap token or admin
+    auth_header = request.headers.get("Authorization", "")
+    api_key = request.headers.get("X-API-Key", "")
+    
+    is_authorized = False
+    if ADMIN_BOOTSTRAP_TOKEN and auth_header == f"Bearer {ADMIN_BOOTSTRAP_TOKEN}":
+        is_authorized = True
+    elif api_key:
+        key_data = verify_api_key(api_key)
+        if key_data and key_data.get("role") == "admin":
+            is_authorized = True
+    
+    if not is_authorized:
+        raise HTTPException(
+            status_code=403, 
+            detail="Admin role or bootstrap token required. Set ADMIN_BOOTSTRAP_TOKEN env var for first-time setup."
+        )
+    
     key, response = create_api_key(data)
-    # Return the key only once
     response.key = key
     return response
 
 @app.get("/auth/api-keys", tags=["Auth"])
-async def list_keys(_: dict = Depends(get_authenticated_key)):
+async def list_keys(_: dict = Depends(require_admin)):
     """List all API keys (admin only)."""
     return {"keys": _list_api_keys()}
 
 @app.delete("/auth/api-keys/{key_name}", tags=["Auth"])
-async def delete_key(key_name: str, _: dict = Depends(get_authenticated_key)):
-    """Revoke an API key."""
-    # Find key by name
-    for key, data in list(api_keys_store.items()):  # Import api_keys_store from auth
+async def delete_key(key_name: str, _: dict = Depends(require_admin)):
+    """Revoke an API key (admin only)."""
+    for key, data in list(api_keys_store.items()):
         if data["name"] == key_name:
             revoke_api_key(key)
             return {"status": "revoked", "name": key_name}
@@ -243,8 +298,13 @@ def list_models():
 # YOLO26 — Object Detection
 # ══════════════════════════════════════════════════════════════
 @app.post("/detect")
-async def detect(file: UploadFile = File(...), conf: float = Query(0.25)):
-    img = Image.open(io.BytesIO(await file.read()))
+async def detect(
+    file: UploadFile = File(...), 
+    conf: float = Query(0.25),
+    key_data: dict = Depends(get_authenticated_key),
+):
+    content = await validate_file(file)
+    img = Image.open(io.BytesIO(content))
     results = yolo(img, conf=conf)
     detections = []
     for r in results:
@@ -260,8 +320,14 @@ async def detect(file: UploadFile = File(...), conf: float = Query(0.25)):
 # Tesseract — OCR
 # ══════════════════════════════════════════════════════════════
 @app.post("/ocr")
-async def ocr(file: UploadFile = File(...), lang: str = Query("eng"), psm: int = Query(3)):
-    img = Image.open(io.BytesIO(await file.read()))
+async def ocr(
+    file: UploadFile = File(...), 
+    lang: str = Query("eng"), 
+    psm: int = Query(3),
+    key_data: dict = Depends(get_authenticated_key),
+):
+    content = await validate_file(file)
+    img = Image.open(io.BytesIO(content))
     cfg = f'--oem 3 --psm {psm}'
     text = pytesseract.image_to_string(img, lang=lang, config=cfg)
     data = pytesseract.image_to_data(img, lang=lang, config=cfg, output_type=pytesseract.Output.DICT)
@@ -272,8 +338,11 @@ async def ocr(file: UploadFile = File(...), lang: str = Query("eng"), psm: int =
     return JSONResponse({"text": text.strip(), "words": words, "lang": lang})
 
 @app.post("/ocr/preprocess")
-async def ocr_preprocess(file: UploadFile = File(...)):
-    nparr = np.frombuffer(await file.read(), np.uint8)
+async def ocr_preprocess(
+    file: UploadFile = File(...),
+    key_data: dict = Depends(get_authenticated_key),
+):
+    nparr = np.frombuffer(await validate_file(file), np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
@@ -285,10 +354,15 @@ async def ocr_preprocess(file: UploadFile = File(...)):
 # Whisper — Speech-to-Text
 # ══════════════════════════════════════════════════════════════
 @app.post("/transcribe")
-async def transcribe(file: UploadFile = File(...), language: str = Query(None)):
+async def transcribe(
+    file: UploadFile = File(...), 
+    language: str = Query(None),
+    key_data: dict = Depends(get_authenticated_key),
+):
+    content = await validate_file(file)
     model = get_whisper()
     with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or ".wav")[1], delete=True) as tmp:
-        tmp.write(await file.read())
+        tmp.write(content)
         tmp.flush()
         opts = {"fp16": False}
         if language:
@@ -302,11 +376,15 @@ async def transcribe(file: UploadFile = File(...), language: str = Query(None)):
     })
 
 @app.post("/detect-language")
-async def detect_language(file: UploadFile = File(...)):
+async def detect_language(
+    file: UploadFile = File(...),
+    key_data: dict = Depends(get_authenticated_key),
+):
     import whisper
+    content = await validate_file(file)
     model = get_whisper()
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-        tmp.write(await file.read())
+        tmp.write(content)
         tmp.flush()
         audio = whisper.load_audio(tmp.name)
         audio = whisper.pad_or_trim(audio)
@@ -319,19 +397,28 @@ async def detect_language(file: UploadFile = File(...)):
 # rembg — Background Removal
 # ══════════════════════════════════════════════════════════════
 @app.post("/remove-bg")
-async def remove_background(file: UploadFile = File(...)):
+async def remove_background(
+    file: UploadFile = File(...),
+    key_data: dict = Depends(get_authenticated_key),
+):
     from rembg import remove
-    output = remove(await file.read())
+    content = await validate_file(file)
+    output = remove(content)
     return Response(content=output, media_type="image/png")
 
 # ══════════════════════════════════════════════════════════════
 # CLIP — Image Classification & Embeddings
 # ══════════════════════════════════════════════════════════════
 @app.post("/clip/classify")
-async def clip_classify(file: UploadFile = File(...), labels: str = Query("cat,dog,car,person,building")):
+async def clip_classify(
+    file: UploadFile = File(...), 
+    labels: str = Query("cat,dog,car,person,building"),
+    key_data: dict = Depends(get_authenticated_key),
+):
     import torch
+    content = await validate_file(file)
     clip_model, preprocess, tokenizer = get_clip()
-    img = Image.open(io.BytesIO(await file.read())).convert("RGB")
+    img = Image.open(io.BytesIO(content)).convert("RGB")
     image_input = preprocess(img).unsqueeze(0)
     label_list = [l.strip() for l in labels.split(",")]
     text_input = tokenizer(label_list)
@@ -345,10 +432,14 @@ async def clip_classify(file: UploadFile = File(...), labels: str = Query("cat,d
     return JSONResponse({"classifications": [{"label": l, "score": round(s, 4)} for l, s in results]})
 
 @app.post("/clip/embed")
-async def clip_embed(file: UploadFile = File(...)):
+async def clip_embed(
+    file: UploadFile = File(...),
+    key_data: dict = Depends(get_authenticated_key),
+):
     import torch
+    content = await validate_file(file)
     clip_model, preprocess, _ = get_clip()
-    img = Image.open(io.BytesIO(await file.read())).convert("RGB")
+    img = Image.open(io.BytesIO(content)).convert("RGB")
     image_input = preprocess(img).unsqueeze(0)
     with torch.no_grad():
         feat = clip_model.encode_image(image_input)
@@ -360,7 +451,7 @@ async def clip_embed(file: UploadFile = File(...)):
 # ══════════════════════════════════════════════════════════════
 @app.post("/edges")
 async def detect_edges(file: UploadFile = File(...), low: int = Query(50), high: int = Query(150)):
-    nparr = np.frombuffer(await file.read(), np.uint8)
+    nparr = np.frombuffer(await validate_file(file), np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
     edges = cv2.Canny(img, low, high)
     _, buf = cv2.imencode('.png', edges)
@@ -368,7 +459,7 @@ async def detect_edges(file: UploadFile = File(...), low: int = Query(50), high:
 
 @app.post("/faces")
 async def detect_faces(file: UploadFile = File(...)):
-    nparr = np.frombuffer(await file.read(), np.uint8)
+    nparr = np.frombuffer(await validate_file(file), np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
@@ -378,7 +469,7 @@ async def detect_faces(file: UploadFile = File(...)):
 
 @app.post("/resize")
 async def resize_image(file: UploadFile = File(...), width: int = Query(640), height: int = Query(480)):
-    nparr = np.frombuffer(await file.read(), np.uint8)
+    nparr = np.frombuffer(await validate_file(file), np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     resized = cv2.resize(img, (width, height))
     _, buf = cv2.imencode('.png', resized)
@@ -386,7 +477,7 @@ async def resize_image(file: UploadFile = File(...), width: int = Query(640), he
 
 @app.post("/analyze")
 async def analyze_image(file: UploadFile = File(...)):
-    nparr = np.frombuffer(await file.read(), np.uint8)
+    nparr = np.frombuffer(await validate_file(file), np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     h, w, c = img.shape
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
