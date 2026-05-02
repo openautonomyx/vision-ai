@@ -1,28 +1,77 @@
+# Production-ready Docker Compose for AutonomyX Vision AI
+# Use profiles: "dev" for development, "prod" for production, "gpu" for GPU
+
 services:
-  vision:
+  vision-dev:
     build: .
-    container_name: vision-ai
+    container_name: vision-ai-dev
+    profiles: ["dev"]
     restart: unless-stopped
     ports:
       - "8120:8000"
     environment:
       - YOLO_MODEL=yolo26n.pt
       - WHISPER_MODEL=base
+      - ENVIRONMENT=development
+    volumes:
+      - vision_data:/app/data
+
+  vision-prod:
+    build: .
+    container_name: vision-ai-prod
+    profiles: ["prod"]
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - YOLO_MODEL=yolo26n.pt
+      - WHISPER_MODEL=base
+      - ENVIRONMENT=production
+      - LOG_LEVEL=info
+    volumes:
+      - vision_data:/app/data
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  vision-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    container_name: vision-ai-gpu
+    profiles: ["gpu"]
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - YOLO_MODEL=yolo26n.pt
+      - WHISPER_MODEL=base
+      - ENVIRONMENT=production
+      - CUDA_VISIBLE_DEVICES=0
     volumes:
       - vision_data:/app/data
     deploy:
       resources:
         limits:
           memory: 8G
-    networks:
-      - platform_frontend
-      - platform_internal
+          cpus: '4'
+          devices:
+            - capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 volumes:
   vision_data:
-
-networks:
-  platform_frontend:
-    external: true
-  platform_internal:
-    external: true
+    driver: local
