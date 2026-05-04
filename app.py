@@ -241,9 +241,9 @@ async def list_keys(_: dict = Depends(require_admin)):
 @app.delete("/auth/api-keys/{key_name}", tags=["Auth"])
 async def delete_key(key_name: str, _: dict = Depends(require_admin)):
     """Revoke an API key (admin only)."""
-    for key, data in list(api_keys_store.items()):
+    for key_hash, data in list(api_keys_store.items()):
         if data["name"] == key_name:
-            revoke_api_key(key)
+            api_keys_store[key_hash]["is_active"] = False
             return {"status": "revoked", "name": key_name}
     raise HTTPException(status_code=404, detail="Key not found")
 
@@ -450,7 +450,12 @@ async def clip_embed(
 # OpenCV — Image Processing
 # ══════════════════════════════════════════════════════════════
 @app.post("/edges")
-async def detect_edges(file: UploadFile = File(...), low: int = Query(50), high: int = Query(150)):
+async def detect_edges(
+    file: UploadFile = File(...),
+    low: int = Query(50),
+    high: int = Query(150),
+    key_data: dict = Depends(get_authenticated_key),
+):
     nparr = np.frombuffer(await validate_file(file), np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
     edges = cv2.Canny(img, low, high)
@@ -458,7 +463,10 @@ async def detect_edges(file: UploadFile = File(...), low: int = Query(50), high:
     return Response(content=buf.tobytes(), media_type="image/png")
 
 @app.post("/faces")
-async def detect_faces(file: UploadFile = File(...)):
+async def detect_faces(
+    file: UploadFile = File(...),
+    key_data: dict = Depends(get_authenticated_key),
+):
     nparr = np.frombuffer(await validate_file(file), np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -468,7 +476,12 @@ async def detect_faces(file: UploadFile = File(...)):
     return JSONResponse({"faces": results, "count": len(results)})
 
 @app.post("/resize")
-async def resize_image(file: UploadFile = File(...), width: int = Query(640), height: int = Query(480)):
+async def resize_image(
+    file: UploadFile = File(...),
+    width: int = Query(640),
+    height: int = Query(480),
+    key_data: dict = Depends(get_authenticated_key),
+):
     nparr = np.frombuffer(await validate_file(file), np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     resized = cv2.resize(img, (width, height))
@@ -476,7 +489,10 @@ async def resize_image(file: UploadFile = File(...), width: int = Query(640), he
     return Response(content=buf.tobytes(), media_type="image/png")
 
 @app.post("/analyze")
-async def analyze_image(file: UploadFile = File(...)):
+async def analyze_image(
+    file: UploadFile = File(...),
+    key_data: dict = Depends(get_authenticated_key),
+):
     nparr = np.frombuffer(await validate_file(file), np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     h, w, c = img.shape

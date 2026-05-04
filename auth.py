@@ -13,7 +13,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
 # In-memory store for API keys (use Redis or database for production)
-# Format: {api_key: {name, created_at, expires_at, role, rate_limit, last_used}}
+# Format: {hashed_api_key: {name, created_at, expires_at, role, rate_limit, last_used}}
 api_keys_store: dict = {}
 
 ADMIN_BOOTSTRAP_NOTE = "For first-time setup, set ADMIN_BOOTSTRAP_TOKEN environment variable"
@@ -57,7 +57,8 @@ def create_api_key(data: APIKeyCreate) -> tuple[str, APIKeyResponse]:
     if data.expires_in_days:
         expires_at = (now + timedelta(days=data.expires_in_days)).isoformat()
     
-    api_keys_store[key] = {
+    hashed = _hash_key(key)
+    api_keys_store[hashed] = {
         "name": data.name,
         "role": data.role,
         "rate_limit": data.rate_limit,
@@ -80,16 +81,17 @@ def create_api_key(data: APIKeyCreate) -> tuple[str, APIKeyResponse]:
 
 def get_api_key_info(key: str) -> Optional[APIKeyInfo]:
     """Get info about an API key without exposing the key."""
-    if key not in api_keys_store:
+    hashed = _hash_key(key)
+    if hashed not in api_keys_store:
         return None
     
-    data = api_keys_store[key]
+    data = api_keys_store[hashed]
     return APIKeyInfo(
         name=data["name"],
         role=data["role"],
         rate_limit=data["rate_limit"],
         created_at=data["created_at"],
-        expires_at=data["last_used"],
+        expires_at=data["expires_at"],
         last_used=data.get("last_used"),
         is_active=data["is_active"]
     )
@@ -99,11 +101,12 @@ def verify_api_key(key: str) -> Optional[dict]:
     if not key:
         return None
     
+    hashed = _hash_key(key)
     # Check if key exists
-    if key not in api_keys_store:
+    if hashed not in api_keys_store:
         return None
     
-    data = api_keys_store[key]
+    data = api_keys_store[hashed]
     
     # Check if key is active
     if not data.get("is_active", False):
@@ -122,8 +125,9 @@ def verify_api_key(key: str) -> Optional[dict]:
 
 def revoke_api_key(key: str) -> bool:
     """Revoke an API key."""
-    if key in api_keys_store:
-        api_keys_store[key]["is_active"] = False
+    hashed = _hash_key(key)
+    if hashed in api_keys_store:
+        api_keys_store[hashed]["is_active"] = False
         return True
     return False
 
