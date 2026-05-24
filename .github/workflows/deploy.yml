@@ -1,0 +1,22 @@
+name: Deploy Vision AI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: AGenNext/code-deploy/.github/workflows/production-deploy-agent.yml@main
+    with:
+      app_name: vision-ai
+      provider: webhook
+      compose_file: docker-compose.deploy.yml
+      dockerfile: Dockerfile
+      app_port: '8000'
+      health_path: /health
+      run_local_container_check: true
+      run_playwright: true
+    secrets:
+      DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+      DEPLOYED_BASE_URL: ${{ secrets.DEPLOYED_BASE_URL }}
